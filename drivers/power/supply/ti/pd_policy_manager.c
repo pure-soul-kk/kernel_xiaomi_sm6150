@@ -44,10 +44,7 @@
 #define BAT_CURR_LOOP_LMT		BATT_FAST_CHG_CURR
 #define BUS_VOLT_LOOP_LMT		BUS_OVP_THRESHOLD
 
-//config monitor time (ms)
-#define PM_WORK_RUN_NORMAL_INTERVAL		500
-#define PM_WORK_RUN_QUICK_INTERVAL		200
-#define PM_WORK_RUN_CRITICAL_INTERVAL		100
+#define PM_WORK_RUN_INTERVAL		100
 
 enum {
 	PM_ALGO_RET_OK,
@@ -143,30 +140,6 @@ static int pd_get_batt_current_thermal_level(struct usbpd_pm *pdpm, int *level)
 	pr_debug("pval.intval: %d\n", pval.intval);
 
 	*level = pval.intval;
-	return rc;
-}
-
-/* get capacity from battery power supply property */
-static int pd_get_batt_capacity(struct usbpd_pm *pdpm, int *capacity)
-{
-	union power_supply_propval pval = {0,};
-	int rc = 0;
-
-	usbpd_check_batt_psy(pdpm);
-
-	if (!pdpm->sw_psy)
-		return -ENODEV;
-
-	rc = power_supply_get_property(pdpm->sw_psy,
-				POWER_SUPPLY_PROP_CAPACITY, &pval);
-	if (rc < 0) {
-		pr_info("Couldn't get battery capacity:%d\n", rc);
-		return rc;
-	}
-
-	pr_info("battery capacity is : %d\n", pval.intval);
-
-	*capacity = pval.intval;
 	return rc;
 }
 
@@ -364,12 +337,8 @@ static void usbpd_check_cp_psy(struct usbpd_pm *pdpm)
 			pdpm->cp_psy = power_supply_get_by_name("bq2597x-master");
 		else
 			pdpm->cp_psy = power_supply_get_by_name("bq2597x-standalone");
-		if (!pdpm->cp_psy) {
-			pdpm->cp_psy = power_supply_get_by_name("ln8000");
-			if (!pdpm->cp_psy) {
-				pr_err("cp_psy not found\n");
-			}
-		}
+		if (!pdpm->cp_psy)
+			pr_err("cp_psy not found\n");
 	}
 }
 
@@ -379,28 +348,6 @@ static void usbpd_check_cp_sec_psy(struct usbpd_pm *pdpm)
 		pdpm->cp_sec_psy = power_supply_get_by_name("bq2597x-slave");
 		if (!pdpm->cp_sec_psy)
 			pr_err("cp_sec_psy not found\n");
-	}
-}
-
-static bool ln8000_is_valid = false;
-static bool usbpd_check_ln8000_chg(struct usbpd_pm *pdpm)
-{
-	int rc;
-	union power_supply_propval val;
-
-	rc = power_supply_get_property(pdpm->cp_psy,
-				POWER_SUPPLY_PROP_MODEL_NAME, &val);
-	if (rc < 0) {
-		pr_err("Failed getting charger IC name, rc=%d\n", rc);
-		ln8000_is_valid = false;
-	}
-
-	if (strcmp(val.strval, "ln8000") == 0) {
-		ln8000_is_valid = true;
-                pr_err("Getting ln8000 charger IC name, rc=%d\n", rc);
-	} else {
-		ln8000_is_valid = false;
-                pr_err("Failed getting ln8000 charger IC name, rc=%d\n", rc);
 	}
 }
 
@@ -958,6 +905,8 @@ static void usbpd_update_pps_status(struct usbpd_pm *pdpm)
 	}
 }
 
+#define TAPER_TIMEOUT	(5000 / PM_WORK_RUN_INTERVAL)
+#define IBUS_CHANGE_TIMEOUT  (500 / PM_WORK_RUN_INTERVAL)
 static int usbpd_pm_fc2_charge_algo(struct usbpd_pm *pdpm)
 {
 	int ret = 0;
@@ -972,17 +921,7 @@ static int usbpd_pm_fc2_charge_algo(struct usbpd_pm *pdpm)
 	int effective_fcc_val = 0;
 	int effective_fcc_taper = 0;
 	int thermal_level = 0;
-	int taper_timeout;
-        int ibus_change_timeout;
 	static int curr_fcc_limit, curr_ibus_limit, ibus_limit;
-
-	if (ln8000_is_valid) {
-		taper_timeout = 25000 / PM_WORK_RUN_NORMAL_INTERVAL;
-		ibus_change_timeout = 2500 / PM_WORK_RUN_NORMAL_INTERVAL;
-	} else {
-		taper_timeout = 5000 / PM_WORK_RUN_CRITICAL_INTERVAL;
-		ibus_change_timeout = 500 / PM_WORK_RUN_CRITICAL_INTERVAL;
-	}
 
 	//usbpd_set_new_fcc_voter(pdpm);
 
@@ -1006,7 +945,7 @@ static int usbpd_pm_fc2_charge_algo(struct usbpd_pm *pdpm)
 
 	/* reduce bus current in cv loop */
 	if (pdpm->cp.vbat_volt > pm_config.bat_volt_lp_lmt - BQ_TAPER_HYS_MV) {
-		if (ibus_lmt_change_timer++ > ibus_change_timeout && !pdpm->disable_taper_fcc) {
+		if (ibus_lmt_change_timer++ > IBUS_CHANGE_TIMEOUT && !pdpm->disable_taper_fcc) {
 			ibus_lmt_change_timer = 0;
 			ibus_limit = curr_ibus_limit - 100;
 			effective_fcc_taper = usbpd_get_effective_fcc_val(pdpm);
@@ -1115,7 +1054,7 @@ static int usbpd_pm_fc2_charge_algo(struct usbpd_pm *pdpm)
 	/*check overcharge when it is cool*/
 	if (pdpm->cp.vbat_volt > pm_config.bat_volt_lp_lmt
 			&& is_cool_charge(pdpm)) {
-		if (cool_overcharge_timer++ > taper_timeout) {
+		if (cool_overcharge_timer++ > TAPER_TIMEOUT) {
 			pr_info("cool overcharge\n");
 			cool_overcharge_timer = 0;
 			return PM_ALGO_RET_TAPER_DONE;
@@ -1126,7 +1065,7 @@ static int usbpd_pm_fc2_charge_algo(struct usbpd_pm *pdpm)
 	/* charge pump taper charge */
 	if (pdpm->cp.vbat_volt > pm_config.bat_volt_lp_lmt - TAPER_VOL_HYS
 			&& pdpm->cp.ibat_curr < pm_config.fc2_taper_current) {
-		if (fc2_taper_timer++ > taper_timeout) {
+		if (fc2_taper_timer++ > TAPER_TIMEOUT) {
 			pr_info("charge pump taper charging done\n");
 			fc2_taper_timer = 0;
 			return PM_ALGO_RET_TAPER_DONE;
@@ -1195,7 +1134,6 @@ static int usbpd_pm_sm(struct usbpd_pm *pdpm)
 	static bool recover;
 	int effective_fcc_val = 0;
 	int thermal_level = 0;
-	int capacity = 0;
 	static int curr_fcc_lmt, curr_ibus_lmt, retry_count;
 	static int request_fail_count = 0;
 
@@ -1210,9 +1148,6 @@ static int usbpd_pm_sm(struct usbpd_pm *pdpm)
 		pdpm->is_temp_out_fc2_range = pd_disable_cp_by_jeita_status(pdpm);
 		pr_info("is_temp_out_fc2_range:%d\n", pdpm->is_temp_out_fc2_range);
 
-		if (ln8000_is_valid)
-		pd_get_batt_capacity(pdpm, &capacity);
-
 		effective_fcc_val = usbpd_get_effective_fcc_val(pdpm);
 
 		if (effective_fcc_val > 0) {
@@ -1226,8 +1161,8 @@ static int usbpd_pm_sm(struct usbpd_pm *pdpm)
 
 		if (pdpm->cp.vbat_volt < pm_config.min_vbat_for_cp) {
 			pr_info("batt_volt %d, waiting...\n", pdpm->cp.vbat_volt);
-		} else if (pdpm->cp.vbat_volt > pm_config.bat_volt_lp_lmt - 50 || (capacity > 89 && ln8000_is_valid)) {
-			pr_info("batt_volt %d or capacity is too high for cp, charging with switch charger\n",
+		} else if (pdpm->cp.vbat_volt > pm_config.bat_volt_lp_lmt - 50) {
+			pr_info("batt_volt %d is too high for cp, charging with switch charger\n",
 					pdpm->cp.vbat_volt);
 			usbpd_pm_move_state(pdpm, PD_PM_STATE_FC2_EXIT);
 			if (pm_config.bat_volt_lp_lmt < BAT_VOLT_LOOP_LMT)
@@ -1474,7 +1409,6 @@ static void usbpd_pm_workfunc(struct work_struct *work)
 {
 	struct usbpd_pm *pdpm = container_of(work, struct usbpd_pm,
 					pm_work.work);
-	int interval;
 
 	usbpd_pm_update_sw_status(pdpm);
 	usbpd_pm_update_cp_status(pdpm);
@@ -1484,18 +1418,9 @@ static void usbpd_pm_workfunc(struct work_struct *work)
 	pr_info("%s:pd_bat_volt_lp_lmt=%d, vbatt_now=%d\n",
 			__func__, pm_config.bat_volt_lp_lmt, pdpm->cp.vbat_volt);
 
-	if (!usbpd_pm_sm(pdpm) && pdpm->pd_active) {
-		if (pdpm->state == PD_PM_STATE_FC2_ENTRY_2 && ln8000_is_valid) {
-			interval = PM_WORK_RUN_QUICK_INTERVAL;
-                   } else if (ln8000_is_valid) {
-			interval = PM_WORK_RUN_NORMAL_INTERVAL;
-                   } else {
-			interval = PM_WORK_RUN_CRITICAL_INTERVAL;
-                   }
-
+	if (!usbpd_pm_sm(pdpm) && pdpm->pd_active)
 		schedule_delayed_work(&pdpm->pm_work,
-				msecs_to_jiffies(interval));
-	}
+				msecs_to_jiffies(PM_WORK_RUN_INTERVAL));
 }
 
 static void usbpd_pm_disconnect(struct usbpd_pm *pdpm)
@@ -1504,12 +1429,9 @@ static void usbpd_pm_disconnect(struct usbpd_pm *pdpm)
 
 	cancel_delayed_work_sync(&pdpm->pm_work);
 
-	if (pdpm->fcc_votable) {
+	if (pdpm->fcc_votable)
 		vote(pdpm->fcc_votable, BQ_TAPER_FCC_VOTER,
 				false, 0);
-		vote(pdpm->fcc_votable, PD_UNVERIFED_VOTER,
-				false, 0);
-	}
 	pdpm->pps_supported = false;
 	pdpm->jeita_triggered = false;
 	pdpm->is_temp_out_fc2_range = false;
@@ -1554,20 +1476,8 @@ static void usbpd_pps_non_verified_contact(struct usbpd_pm *pdpm, bool connected
 
 	if (connected) {
 		usbpd_pm_evaluate_src_caps(pdpm);
-
-		if (pdpm->pps_supported) {
-			if (!pdpm->fcc_votable)
-				pdpm->fcc_votable = find_votable("FCC");
-
-			if ((pdpm->apdo_max_volt / 1000) * (pdpm->apdo_max_curr / 1000) < 33) {
-				if (pdpm->fcc_votable)
-					vote(pdpm->fcc_votable, PD_UNVERIFED_VOTER, true, PD_UNVERIFED_CURRENT_LOW);
-			} else {
-				if (pdpm->fcc_votable)
-					vote(pdpm->fcc_votable, PD_UNVERIFED_VOTER, true, PD_UNVERIFED_CURRENT_HIGH);
-			}
+		if (pdpm->pps_supported)
 			schedule_delayed_work(&pdpm->pm_work, 5*HZ);
-		}
 	} else {
 		usbpd_pm_disconnect(pdpm);
 	}
@@ -1764,7 +1674,6 @@ static int usbpd_pm_probe(struct platform_device *pdev)
 
 	usbpd_check_cp_psy(pdpm);
 	usbpd_check_cp_sec_psy(pdpm);
-        usbpd_check_ln8000_chg(pdpm);
 	usbpd_check_usb_psy(pdpm);
 
 	INIT_WORK(&pdpm->cp_psy_change_work, cp_psy_change_work);
