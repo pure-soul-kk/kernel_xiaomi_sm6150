@@ -14,7 +14,7 @@ config CHARGER_LN8000
         depends on I2C
         select REGMAP_I2C
         help
-          Say Y to enable support for the LN8000 charger.
+          Say Y to enable support for the LN8000 charger
 
 config K9A_CHARGE
 	bool
