@@ -33,6 +33,8 @@
 #include <linux/sysfs.h>
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
+#include <linux/sysinfo.h>
+#include <linux/mm.h>
 
 #include "zram_drv.h"
 
@@ -1866,52 +1868,57 @@ static void zram_reset_device(struct zram *zram)
 }
 
 static ssize_t disksize_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
+        struct device_attribute *attr, const char *buf, size_t len)
 {
-	u64 disksize;
-	struct zcomp *comp;
-	struct zram *zram = dev_to_zram(dev);
-	int err;
+    u64 disksize;
+    struct sysinfo si;
+    struct zcomp *comp;
+    struct zram *zram = dev_to_zram(dev);
+    int err;
 
-	disksize = memparse(buf, NULL);
-	if (!disksize)
-		return -EINVAL;
+    /* Instead of using user-supplied value from "buf" using memparse(),
+     * we read the system memory info. This computes disksize as:
+     *      disksize = (total_physical_ram * 1.5)
+     * For example, 6 GB -> 9 GB, 8 GB -> 12 GB.
+     */
+    si_meminfo(&si);
+    /* si.totalram is in units of si.mem_unit bytes */
+    disksize = (u64)si.totalram * si.mem_unit;
+    disksize = PAGE_ALIGN(disksize + (disksize >> 1));  // Multiply by 1.5, then align
 
-	down_write(&zram->init_lock);
-	if (init_done(zram)) {
-		pr_info("Cannot change disksize for initialized device\n");
-		err = -EBUSY;
-		goto out_unlock;
-	}
+    down_write(&zram->init_lock);
+    if (init_done(zram)) {
+        pr_info("Cannot change disksize for initialized device\n");
+        err = -EBUSY;
+        goto out_unlock;
+    }
 
-	disksize = PAGE_ALIGN(disksize);
-	if (!zram_meta_alloc(zram, disksize)) {
-		err = -ENOMEM;
-		goto out_unlock;
-	}
+    if (!zram_meta_alloc(zram, disksize)) {
+        err = -ENOMEM;
+        goto out_unlock;
+    }
 
-	comp = zcomp_create(zram->compressor);
-	if (IS_ERR(comp)) {
-		pr_err("Cannot initialise %s compressing backend\n",
-				zram->compressor);
-		err = PTR_ERR(comp);
-		goto out_free_meta;
-	}
+    comp = zcomp_create(zram->compressor);
+    if (IS_ERR(comp)) {
+        pr_err("Cannot initialize %s compressing backend\n", zram->compressor);
+        err = PTR_ERR(comp);
+        goto out_free_meta;
+    }
 
-	zram->comp = comp;
-	zram->disksize = disksize;
-	set_capacity(zram->disk, zram->disksize >> SECTOR_SHIFT);
+    zram->comp = comp;
+    zram->disksize = disksize;
+    set_capacity(zram->disk, zram->disksize >> SECTOR_SHIFT);
+    revalidate_disk(zram->disk);
+    up_write(&zram->init_lock);
 
-	revalidate_disk(zram->disk);
-	up_write(&zram->init_lock);
-
-	return len;
+    pr_info("Setting zram disksize to %llu bytes (1.5x physical RAM)\n", disksize);
+    return len;
 
 out_free_meta:
-	zram_meta_free(zram, disksize);
+    zram_meta_free(zram, disksize);
 out_unlock:
-	up_write(&zram->init_lock);
-	return err;
+    up_write(&zram->init_lock);
+    return err;
 }
 
 static ssize_t reset_store(struct device *dev,
